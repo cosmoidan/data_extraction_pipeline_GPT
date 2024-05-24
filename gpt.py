@@ -78,16 +78,19 @@ class GPTDataProcessor:
                  validation_json_field_name: str = '',
                  cache_file: str = '',
                  cache_dir: str = 'cache',
+                 data_dir: str = '',
                  output_dir: str = 'output',
                  output_filename: str = '',
                  output_format: str = 'xlsx',
+                 validate: bool = False,
+                 print_output_of_ids: list[int] = []
                  ):
         self.model_version: str = model_version
         self.df: pd.DataFrame = None
         self.sample_size: int = sample_size
         self.batch_size: int = batch_size
         self.sample_mode: bool = sample_mode
-        self.model: str = gpt_model,
+        self.model: str = gpt_model
         self.response_choices: int = response_choices
         self.target_col_name: str = target_col_name
         self.index_col_name: str = index_col_name
@@ -96,23 +99,25 @@ class GPTDataProcessor:
         self.cache_dir: str = cache_dir
         self.cache_file: str = cache_file
         self.output_dir: str = output_dir
+        self.data_dir: str = data_dir
         self.output_filename: str = output_filename
         self.output_format: str = output_format
         self.extractions: list[tuple] = []
+        self.validate: bool = validate
         self.validated: pd.DataFrame = pd.DataFrame()
+        self.print_output_of_ids: list[int] = print_output_of_ids
 
     def _get_api_key(self) -> None:
         with open('OPENAI_API_KEY.txt', 'r') as key:
             return key.read()
 
-    def _read_files(self, path: str = "data") -> pd.DataFrame:
-        pth = Path(os.getcwd()) / path
-        files = list(pth.glob("*.xlsx"))
+    def _read_files(self) -> pd.DataFrame:
+        df: pd.DataFrame = pd.DataFrame()
+        files: list[Path] = list(Path(self.data_dir).glob("*.xlsx"))
         if not files:
             print("No files found in the specified directory.")
-            return None
-        dfs = []
-        dfs_by_cols = defaultdict(list)
+        dfs: list[pd.DataFrame] = []
+        dfs_by_cols: defaultdict = defaultdict(list)
         for file in files:
             try:
                 df = pd.read_excel(file, engine="openpyxl")
@@ -125,13 +130,11 @@ class GPTDataProcessor:
             print(k, len(v))
         if not dfs:
             print("No files successfully read.")
-            return None
         try:
             df = pd.concat(dfs, axis=0).reset_index(drop=True)
         except Exception as e:
-            print("Error concatenating dataframes.")
+            print("Error concatenating DataFrames!")
             print(e)
-            return None
         return df
 
     def _build_prompts(self, summaries: list[tuple]) -> list[dict]:
@@ -157,7 +160,7 @@ class GPTDataProcessor:
             batched_summaries.append(summaries[i:i + self.batch_size])
         return batched_summaries
 
-    def _extract_jsons(self, summaries: list[tuple]) -> list[dict]:
+    def _execute_gpt(self, summaries: list[tuple]) -> list[dict]:
         api_key: str = self._get_api_key()
         client = OpenAI(
             api_key=api_key if api_key else os.getenv("OPENAI_API_KEY"))
@@ -183,10 +186,10 @@ class GPTDataProcessor:
 
     def _prepare_summaries(self, df: pd.DataFrame) -> list[tuple]:
         if self.sample_mode:
-            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_column_names]
+            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
                                                    ].dropna(how='any').sample(self.sample_size).values]
         else:
-            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_column_names]
+            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
                                                    ].dropna(how='any').values]
 
     def _extract_data(self) -> None:
@@ -197,19 +200,21 @@ class GPTDataProcessor:
                 extractions = self._load_from_cache()
             else:
                 df = self._read_files()
-                summaries = self._prepare_summaries(df=df)
-                # hit the api
-                results: list[dict] = self._extract_jsons(summaries=summaries)
-                if len(results) != len(summaries):
-                    print(
-                        "Error extracting JSON data. Summary and response sizes do not match."
-                    )
-                    return None
-                for summary, result in zip(summaries, results):
-                    extractions['results'].append((summary, result))
-                extractions['dataframe'] = df.dropna(how='any', subset=(
-                    self.index_col_name, self.target_column_names))
-                self._write_to_cache(extractions)
+                if not df.empty:
+                    summaries = self._prepare_summaries(df=df)
+                    # hit the api
+                    results: list[dict] = self._execute_gpt(
+                        summaries=summaries)
+                    if len(results) != len(summaries):
+                        print(
+                            "Error extracting JSON data. Summary and response sizes do not match."
+                        )
+                        return None
+                    for summary, result in zip(summaries, results):
+                        extractions['results'].append((summary, result))
+                    extractions['dataframe'] = df.dropna(how='any', subset=(
+                        self.index_col_name, self.target_col_name))
+                    self._write_to_cache(extractions)
         except FileNotFoundError as e:
             print('Cached file not found!')
         self.extractions = extractions
@@ -224,7 +229,7 @@ class GPTDataProcessor:
         try:
             df: pd.DataFrame = self.extractions['dataframe']
             df.dropna(how='any', inplace=True, subset=(
-                self.index_col_name, self.target_column_names))
+                self.index_col_name, self.target_col_name))
             for results in self.extractions['results']:
                 record_ID = results[1]["ID"]
                 manually_extracted = df.loc[df[self.index_col_name]
@@ -267,36 +272,43 @@ class GPTDataProcessor:
         with open(Path(self.cache_dir) / self.cache_file, 'rb') as fp:
             return pickle.load(fp)
 
-    def _print_results(self, print_record_ids: list[int] = None) -> None:
-        if print_record_ids:
-            if print_record_ids[0] == 0:
+    def _print_results(self) -> None:
+        if self.print_output_of_ids:
+            if self.print_output_of_ids[0] == 0:
                 pp(self.extractions['results'])
             else:
-                for r in print_record_ids:
+                for r in self.print_output_of_ids:
                     pp(next(
                         (t[1] for t in self.extractions['results'] if t[0][0] == r), None))
                     print('\n')
-        if not self.validated.empty:
-            print(self.validated)
-            print(f'''True Positive: {
-                self.validated['success'].value_counts()[True]}''')
-            print(f'''False Positive: {
-                self.validated['success'].value_counts()[False]}''')
+        if self.validate and not self.validated.empty:
+            pp(self.validated.head(5))
+            try:
+                print(f'''True Positive: {
+                    self.validated['success'].value_counts()[True]}''')
+            except KeyError:
+                pass
+            try:
+                print(f'''False Positive: {
+                    self.validated['success'].value_counts()[False]}''')
+            except KeyError:
+                pass
 
     def _write_output_file(self) -> None:
-        if not self.validated.empty:
+        if self.validate and not self.validated.empty:
             if self.output_format == 'xlsx':
                 self.validated.to_excel(
                     Path(self.output_dir) / (self.output_filename + '.xlsx'), index=False)
             else:
-                #  can add additional output formats here
-                pass
+                pass  #  can add additional output formats here
+        else:
+            pass  # can write non-validation output here
 
     def execute(self) -> None:
         self._extract_data()
-        self._validate_extractions()
-        # 0 for ALL records, empty for None, list of IDs for those IDs
-        self._print_results(print_record_ids=[929])
+        if self.validate:
+            self._validate_extractions()
+        self._print_results()
         self._write_output_file()
 
 
@@ -304,19 +316,23 @@ def main() -> None:
     MODEL_VERSION = 'v4'
     GPT_MODEL = 'gpt-4o'  # gpt-4-turbo-2024-04-09
     SAMPLE_MODE = True  # False processes entire population!
-    SAMPLE_SIZE = 5
-    BATCH_SIZE = 1,
-    RESPONSE_CHOICES = 1,
+    SAMPLE_SIZE = 1
+    BATCH_SIZE = 1
+    RESPONSE_CHOICES = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
     VALIDATION_COL_NAME: str = 'UAS ALT'
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
-    CACHE_FILE: str = 'extractions_09_05_2024_01_04_12_185843.pkl'  # blank queries GPT!
-    CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache{
-        MODEL_VERSION}'
+    CACHE_FILE: str = ''  # blank queries GPT!
+    CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
+        MODEL_VERSION}/'
+    INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
     OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
-    OUTPUT_FILENAME: str = f'gtp_800-999_{MODEL_VERSION}'
+    OUTPUT_FILENAME: str = f'gtp4o_3d_db_{MODEL_VERSION}'
     OUTPUT_FORMAT: str = 'xlsx'
+    VALIDATE: bool = True
+    # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
+    PRINT_OUTPUT_OF_IDS = []
 
     gpt = GPTDataProcessor(gpt_model=GPT_MODEL,
                            sample_mode=SAMPLE_MODE,
@@ -330,9 +346,12 @@ def main() -> None:
                            validation_json_field_name=VALIDATION_JSON_FIELD_NAME,
                            cache_file=CACHE_FILE,
                            cache_dir=CACHE_DIR,
+                           data_dir=INPUT_DATA_DIR,
                            output_dir=OUTPUT_DIR,
                            output_filename=OUTPUT_FILENAME,
                            output_format=OUTPUT_FORMAT,
+                           validate=VALIDATE,
+                           print_output_of_ids=PRINT_OUTPUT_OF_IDS,
                            )
     gpt.execute()
 
