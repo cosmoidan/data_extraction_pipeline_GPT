@@ -9,8 +9,12 @@ from collections import defaultdict
 import time
 from datetime import datetime as dt
 from openai import OpenAI
+from openai import AssistantEventHandler
+from typing_extensions import override
 from pprint import pp
-from sys_prompts_v4 import SYSTEM_PROMPTS
+from sys_prompts_v5 import SYSTEM_PROMPTS
+from user_prompts_v1 import USER_PROMPTS
+from user_prompt_end_v2 import USER_PROMPTS_END
 
 
 class FAADataDownloader:
@@ -77,13 +81,21 @@ class GPTDataProcessor:
                  validation_col_name: str = '',
                  validation_json_field_name: str = '',
                  cache_file: str = '',
-                 cache_dir: str = 'cache',
+                 batch_cache_dir: str = 'cache',
+                 extractions_cache_dir: str = 'cache/extractions',
                  data_dir: str = '',
                  output_dir: str = 'output',
                  output_filename: str = '',
                  output_format: str = 'xlsx',
+                 end_separator: str = '###',
                  validate: bool = False,
-                 print_output_of_ids: list[int] = []
+                 print_output_of_ids: list[int] = [],
+                 summaries_dir: str = 'tmp_data',
+                 summaries_file: str = 'summaries',
+                 summaries_format: str = 'xlsx',
+                 batch_wait_time: int = 90,
+                 start_batch: int = 1,
+                 rebuild_from_cache: bool = False,
                  ):
         self.model_version: str = model_version
         self.df: pd.DataFrame = None
@@ -96,7 +108,8 @@ class GPTDataProcessor:
         self.index_col_name: str = index_col_name
         self.validation_column_name: str = validation_col_name
         self.validation_json_field_name: str = validation_json_field_name
-        self.cache_dir: str = cache_dir
+        self.batch_cache_dir: str = batch_cache_dir
+        self.extractions_cache_dir: str = extractions_cache_dir
         self.cache_file: str = cache_file
         self.output_dir: str = output_dir
         self.data_dir: str = data_dir
@@ -106,6 +119,15 @@ class GPTDataProcessor:
         self.validate: bool = validate
         self.validated: pd.DataFrame = pd.DataFrame()
         self.print_output_of_ids: list[int] = print_output_of_ids
+        self.summaries: list[tuple] = []
+        self.summaries_dir: str = summaries_dir
+        self.summaries_file: str = summaries_file
+        self.summaries_format: str = summaries_format
+        self.assistant_results: list = []
+        self.end_separator: str = end_separator
+        self.batch_wait_time: int = batch_wait_time
+        self.start_batch: int = start_batch
+        self.rebuild_from_cache: bool = rebuild_from_cache
 
     def _get_api_key(self) -> None:
         with open('OPENAI_API_KEY.txt', 'r') as key:
@@ -138,88 +160,108 @@ class GPTDataProcessor:
         return df
 
     def _build_prompts(self, summaries: list[tuple]) -> list[dict]:
-        summary_prompts = [
-            {
-                "role": "user",
-                "content": f"Here is data from the FAA Drone Sightings dataset.",
-            }
-        ]
-        for summary in summaries:
-            summary_prompts.append({"role": "user", "content": summary})
-        summary_prompts.append(
-            {
-                "role": "user",
-                "content": "Take a deep breath and solve the problem step by step. It's important you get this right.",
-            }
-        )
-        return SYSTEM_PROMPTS + summary_prompts
+        summary_prompts = USER_PROMPTS
+        summaries_str = f'{self.end_separator}'.join(
+            [s for s in summaries]) + self.end_separator
+        summary_prompts.append({"role": "user", "content": summaries_str})
+        summary_prompts += USER_PROMPTS_END
+        return SYSTEM_PROMPTS + [
+            {"role": "system",
+             "content": f"Each report is separated by this token: {self.end_separator}"}
+        ] + summary_prompts
 
-    def _batch_summaries(self, summaries: list[tuple]) -> list[list[tuple]]:
+    def _batch_summaries(self) -> list[list[tuple]]:
         batched_summaries: list = []
-        for i in range(0, len(summaries), self.batch_size):
-            batched_summaries.append(summaries[i:i + self.batch_size])
+        for i in range(0, len(self.summaries), self.batch_size):
+            batched_summaries.append(self.summaries[i:i + self.batch_size])
         return batched_summaries
 
-    def _execute_gpt(self, summaries: list[tuple]) -> list[dict]:
+    def _format_instructions(self) -> str:
+        return f"{'. '.join([p['content'].rstrip('.') for p in SYSTEM_PROMPTS])}."
+
+    def _format_user_prompts(self) -> str:
+        return f"{'. '.join([p['content'].rstrip('.') for p in USER_PROMPTS])}."
+
+    def _execute_gpt(self) -> list[dict]:
         api_key: str = self._get_api_key()
         client = OpenAI(
             api_key=api_key if api_key else os.getenv("OPENAI_API_KEY"))
         extracted: list[tuple] = []
-        batched_summaries = self._batch_summaries(summaries=summaries)
-        for batch in batched_summaries:
-            batch_for_cache: list = []
-            summaries_text = [b[1] for b in batch]
-            response = client.chat.completions.create(
-                model=self.model,
-                response_format={"type": "json_object"},
-                messages=self._build_prompts(summaries=summaries_text),
-                n=self.response_choices,
-            )
-            json_results = [c.message.content for c in response.choices]
-            results: list[tuple] = [json.loads(r) for r in json_results]
-            for record_id, result_dict in zip([b[0] for b in batch], results[0]['response']):
-                result_dict["ID"] = record_id
-                extracted.append(result_dict)
-                batch_for_cache.append(result_dict)
-            self._write_to_cache(extractions=batch_for_cache, batch=True)
+        batched_summaries = self._batch_summaries()
+        for batch_idx, batch in enumerate(batched_summaries, 1):
+            if batch_idx >= self.start_batch:
+                print(f"Processing batch {
+                      batch_idx} [Start batch was {self.start_batch}]")
+                batch_for_cache: list = []
+                summaries_text = [b[1] for b in batch]
+                response = client.chat.completions.create(
+                    model=self.model,
+                    response_format={"type": "json_object"},
+                    messages=self._build_prompts(summaries=summaries_text),
+                    n=self.response_choices,
+                    max_tokens=4096,
+                )
+                json_results = [c.message.content for c in response.choices]
+                try:
+                    results: list[tuple] = [
+                        json.loads(r) for r in json_results]
+                    for record_id, result_dict in zip([b[0] for b in batch], results[0]['response']):
+                        result_dict["ID"] = record_id
+                        extracted.append(result_dict)
+                        batch_for_cache.append(result_dict)
+                    if len(batch_for_cache) < self.batch_size:
+                        raise Exception(f'Error processing the batch: The batch size was {
+                                        self.batch_size} but there were only {len(batch_for_cache)} records returned.')
+                    self._write_to_cache(
+                        extractions=batch_for_cache, batch=True)
+                except Exception as e:
+                    print(f"An error occurred while requesting batch {
+                        batch_idx}. The error was: {e}")
+                    raise Exception(f"""Error processing batch: {batch_idx}.
+                                    Error details: {e}.
+                                    Batch content: {batch}""")
+                time.sleep(self.batch_wait_time)
         return extracted
 
-    def _prepare_summaries(self, df: pd.DataFrame) -> list[tuple]:
+    def _prepare_summaries(self, df: pd.DataFrame) -> None:
         if self.sample_mode:
-            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
-                                                   ].dropna(how='any').sample(self.sample_size).values]
+            self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
+                                                             ].dropna(how='any').sample(self.sample_size).values]
         else:
-            return [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
-                                                   ].dropna(how='any').values]
+            self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
+                                                             ].dropna(how='any').values]
 
     def _extract_data(self) -> None:
         extractions: dict = dict()
         extractions['results'] = []
         try:
             if self.cache_file:
-                extractions = self._load_from_cache()
+                extractions = self._load_extractions_from_cache()
             else:
                 df = self._read_files()
                 if not df.empty:
-                    summaries = self._prepare_summaries(df=df)
-                    # hit the api
-                    results: list[dict] = self._execute_gpt(
-                        summaries=summaries)
-                    if len(results) != len(summaries):
+                    self._prepare_summaries(df=df)
+                    if self.rebuild_from_cache:
+                        results: list[dict] = self._rebuild_from_cache()
+                    else:
+                        # hit the api
+                        results: list[dict] = self._execute_gpt()
+                    if len(results) != len(self.summaries):
                         print(
                             "Error extracting JSON data. Summary and response sizes do not match."
                         )
                         return None
-                    for summary, result in zip(summaries, results):
+                    for summary, result in zip(self.summaries, results):
+
                         extractions['results'].append((summary, result))
                     extractions['dataframe'] = df.dropna(how='any', subset=(
                         self.index_col_name, self.target_col_name))
-                    self._write_to_cache(extractions)
+                    self._write_to_cache(extractions, batch=False)
         except FileNotFoundError as e:
             print('Cached file not found!')
         self.extractions = extractions
 
-    def _validate_extractions(self) -> None:
+    def _validate_extractions(self):
         true_positive = 0
         false_positive = 0
         record_IDs = []
@@ -261,16 +303,26 @@ class GPTDataProcessor:
     def _write_to_cache(self, extractions, batch=False) -> None:
         if batch:
             filename = f'{
-                self.cache_dir}/extracted_batch_{dt.now().strftime("%d_%m_%Y_%H_%M_%S_%f")}.pkl'
+                self.batch_cache_dir}/extracted_batch_{dt.now().strftime("%d_%m_%Y_%H_%M_%S_%f")}.pkl'
         else:
             filename = f'{
-                self.cache_dir}/extractions_{dt.now().strftime("%d_%m_%Y_%H_%M_%S_%f")}.pkl'
+                self.extractions_cache_dir}/extractions_{dt.now().strftime("%d_%m_%Y_%H_%M_%S_%f")}.pkl'
         with open(filename, 'wb') as fp:
             pickle.dump(extractions, fp)
 
-    def _load_from_cache(self) -> list[tuple]:
-        with open(Path(self.cache_dir) / self.cache_file, 'rb') as fp:
+    def _load_extractions_from_cache(self) -> list[tuple]:
+        with open(Path(self.extractions_cache_dir) / self.cache_file, 'rb') as fp:
             return pickle.load(fp)
+
+    def _rebuild_from_cache(self) -> list[dict]:
+        extracted = []
+        files: list[Path] = list(Path(self.batch_cache_dir).glob("*.pkl"))
+        if not files:
+            print("No files found in the specified directory.")
+        for f in files:
+            with open(Path(f), 'rb') as fp:
+                extracted += (pickle.load(fp))
+        return extracted
 
     def _print_results(self) -> None:
         if self.print_output_of_ids:
@@ -294,11 +346,20 @@ class GPTDataProcessor:
             except KeyError:
                 pass
 
-    def _write_output_file(self) -> None:
-        if self.validate and not self.validated.empty:
+    def _write_output_file(self, mode=None) -> None:
+        if mode == 'validate' and not self.validated.empty:
             if self.output_format == 'xlsx':
                 self.validated.to_excel(
                     Path(self.output_dir) / (self.output_filename + '.xlsx'), index=False)
+            else:
+                pass  #  can add additional output formats here
+        elif mode == 'summaries':
+            df: pd.DataFrame = pd.DataFrame(self.summaries, columns=[
+                                            self.index_col_name, self.target_col_name])
+            if self.summaries_format == 'xlsx':
+                df.to_excel(
+                    Path(self.summaries_dir) / (self.summaries_file + '.xlsx'), index=False
+                )
             else:
                 pass  #  can add additional output formats here
         else:
@@ -309,26 +370,36 @@ class GPTDataProcessor:
         if self.validate:
             self._validate_extractions()
         self._print_results()
-        self._write_output_file()
+        self._write_output_file(
+            mode='validate' if self.validate else None)
 
 
 def main() -> None:
-    MODEL_VERSION = 'v4'
+    MODEL_VERSION = 'v6'
     GPT_MODEL = 'gpt-4o'  # gpt-4-turbo-2024-04-09
-    SAMPLE_MODE = True  # False processes entire population!
-    SAMPLE_SIZE = 1
-    BATCH_SIZE = 1
+    SAMPLE_MODE = False  # False processes entire population!
+    SAMPLE_SIZE = 5
+    BATCH_SIZE = 5
+    BATCH_WAIT_TIME = 10  # time to wait between batches (secs)
+    START_BATCH = 184  # start at batch number. Set 1 to start at beginning!
     RESPONSE_CHOICES = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
     VALIDATION_COL_NAME: str = 'UAS ALT'
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
-    CACHE_FILE: str = ''  # blank queries GPT!
-    CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
+    END_SEPARATOR: str = '###'
+    CACHE_FILE: str = ''  # load final result set from cache. blank queries GPT!
+    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical!
+    REBUILD_FROM_CACHE: bool = True
+    BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
         MODEL_VERSION}/'
+    EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
     INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
     OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
     OUTPUT_FILENAME: str = f'gtp4o_3d_db_{MODEL_VERSION}'
+    SUMMARIES_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
+    SUMMARIES_FILE: str = 'summaries'
+    SUMMARIES_FORMAT: str = 'xlsx'
     OUTPUT_FORMAT: str = 'xlsx'
     VALIDATE: bool = True
     # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
@@ -345,13 +416,21 @@ def main() -> None:
                            validation_col_name=VALIDATION_COL_NAME,
                            validation_json_field_name=VALIDATION_JSON_FIELD_NAME,
                            cache_file=CACHE_FILE,
-                           cache_dir=CACHE_DIR,
+                           batch_cache_dir=BATCH_CACHE_DIR,
+                           extractions_cache_dir=EXTRACTIONS_CACHE_DIR,
                            data_dir=INPUT_DATA_DIR,
                            output_dir=OUTPUT_DIR,
                            output_filename=OUTPUT_FILENAME,
                            output_format=OUTPUT_FORMAT,
                            validate=VALIDATE,
                            print_output_of_ids=PRINT_OUTPUT_OF_IDS,
+                           summaries_file=SUMMARIES_FILE,
+                           summaries_dir=SUMMARIES_DIR,
+                           summaries_format=SUMMARIES_FORMAT,
+                           end_separator=END_SEPARATOR,
+                           batch_wait_time=BATCH_WAIT_TIME,
+                           start_batch=START_BATCH,
+                           rebuild_from_cache=REBUILD_FROM_CACHE,
                            )
     gpt.execute()
 
