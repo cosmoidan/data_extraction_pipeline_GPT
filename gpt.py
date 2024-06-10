@@ -12,7 +12,7 @@ from openai import OpenAI
 from openai import AssistantEventHandler
 from typing_extensions import override
 from pprint import pp
-from sys_prompts_v5 import SYSTEM_PROMPTS
+from sys_prompts_v6 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
 
@@ -126,7 +126,7 @@ class GPTDataProcessor:
         self.assistant_results: list = []
         self.end_separator: str = end_separator
         self.batch_wait_time: int = batch_wait_time
-        self.start_batch: int = start_batch
+        self.start_batch: int = start_batch if start_batch != 0 else 1
         self.rebuild_from_cache: bool = rebuild_from_cache
 
     def _get_api_key(self) -> None:
@@ -159,10 +159,10 @@ class GPTDataProcessor:
             print(e)
         return df
 
-    def _build_prompts(self, summaries: list[tuple]) -> list[dict]:
+    def _build_prompts(self, batch: list[tuple]) -> list[dict]:
         summary_prompts = USER_PROMPTS
         summaries_str = f'{self.end_separator}'.join(
-            [s for s in summaries]) + self.end_separator
+            [f'RECORD_ID: {s[0]} \n\n{s[1]}' for s in batch]) + self.end_separator
         summary_prompts.append({"role": "user", "content": summaries_str})
         summary_prompts += USER_PROMPTS_END
         return SYSTEM_PROMPTS + [
@@ -193,11 +193,10 @@ class GPTDataProcessor:
                 print(f"Processing batch {
                       batch_idx} [Start batch was {self.start_batch}]")
                 batch_for_cache: list = []
-                summaries_text = [b[1] for b in batch]
                 response = client.chat.completions.create(
                     model=self.model,
                     response_format={"type": "json_object"},
-                    messages=self._build_prompts(summaries=summaries_text),
+                    messages=self._build_prompts(batch=batch),
                     n=self.response_choices,
                     max_tokens=4096,
                 )
@@ -205,18 +204,17 @@ class GPTDataProcessor:
                 try:
                     results: list[tuple] = [
                         json.loads(r) for r in json_results]
-                    for record_id, result_dict in zip([b[0] for b in batch], results[0]['response']):
-                        result_dict["ID"] = record_id
+                    for result_dict in results[0]['response']:
                         extracted.append(result_dict)
                         batch_for_cache.append(result_dict)
                     if len(batch_for_cache) < self.batch_size:
-                        raise Exception(f'Error processing the batch: The batch size was {
-                                        self.batch_size} but there were only {len(batch_for_cache)} records returned.')
+                        raise Exception(f"""Error processing the batch: The batch size was {
+                                        self.batch_size} but there were only {len(batch_for_cache)} records returned.""")
                     self._write_to_cache(
                         extractions=batch_for_cache, batch=True)
                 except Exception as e:
-                    print(f"An error occurred while requesting batch {
-                        batch_idx}. The error was: {e}")
+                    print(f"""An error occurred while requesting batch {
+                        batch_idx}. The error was: {e}""")
                     raise Exception(f"""Error processing batch: {batch_idx}.
                                     Error details: {e}.
                                     Batch content: {batch}""")
@@ -251,9 +249,9 @@ class GPTDataProcessor:
                             "Error extracting JSON data. Summary and response sizes do not match."
                         )
                         return None
-                    for summary, result in zip(self.summaries, results):
-
-                        extractions['results'].append((summary, result))
+                    for summary in self.summaries:
+                        extractions['results'].append(
+                            (summary, next((d for d in results if d.get("record_id") == summary[0]), None)))
                     extractions['dataframe'] = df.dropna(how='any', subset=(
                         self.index_col_name, self.target_col_name))
                     self._write_to_cache(extractions, batch=False)
@@ -273,7 +271,7 @@ class GPTDataProcessor:
             df.dropna(how='any', inplace=True, subset=(
                 self.index_col_name, self.target_col_name))
             for results in self.extractions['results']:
-                record_ID = results[1]["ID"]
+                record_ID = results[1]["record_id"]
                 manually_extracted = df.loc[df[self.index_col_name]
                                             == record_ID, self.validation_column_name].values[0]
                 gpt_extracted = results[1][self.validation_json_field_name]
@@ -375,13 +373,13 @@ class GPTDataProcessor:
 
 
 def main() -> None:
-    MODEL_VERSION = 'v6'
+    MODEL_VERSION = 'v7'
     GPT_MODEL = 'gpt-4o'  # gpt-4-turbo-2024-04-09
-    SAMPLE_MODE = False  # False processes entire population!
-    SAMPLE_SIZE = 5
+    SAMPLE_MODE = True  # False processes entire population!
+    SAMPLE_SIZE = 15
     BATCH_SIZE = 5
-    BATCH_WAIT_TIME = 10  # time to wait between batches (secs)
-    START_BATCH = 184  # start at batch number. Set 1 to start at beginning!
+    BATCH_WAIT_TIME = 5  # time to wait between batches (secs)
+    START_BATCH = 1  # start at batch number. Set 1 to start at beginning!
     RESPONSE_CHOICES = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
@@ -389,8 +387,8 @@ def main() -> None:
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
     END_SEPARATOR: str = '###'
     CACHE_FILE: str = ''  # load final result set from cache. blank queries GPT!
-    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical!
-    REBUILD_FROM_CACHE: bool = True
+    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
+    REBUILD_FROM_CACHE: bool = False
     BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
         MODEL_VERSION}/'
     EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
