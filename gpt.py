@@ -160,9 +160,11 @@ class GPTDataProcessor:
         return df
 
     def _build_prompts(self, batch: list[tuple]) -> list[dict]:
-        summary_prompts = USER_PROMPTS
-        summaries_str = f'{self.end_separator}'.join(
-            [f'RECORD_ID: {s[0]} \n\n{s[1]}' for s in batch]) + self.end_separator
+        summary_prompts = USER_PROMPTS.copy()
+        summaries_str = ''
+        for r in batch:
+            query = f'RECORD_ID: {r[0]} \n\n{r[1]} {self.end_separator}'
+            summaries_str += query
         summary_prompts.append({"role": "user", "content": summaries_str})
         summary_prompts += USER_PROMPTS_END
         return SYSTEM_PROMPTS + [
@@ -176,19 +178,13 @@ class GPTDataProcessor:
             batched_summaries.append(self.summaries[i:i + self.batch_size])
         return batched_summaries
 
-    def _format_instructions(self) -> str:
-        return f"{'. '.join([p['content'].rstrip('.') for p in SYSTEM_PROMPTS])}."
-
-    def _format_user_prompts(self) -> str:
-        return f"{'. '.join([p['content'].rstrip('.') for p in USER_PROMPTS])}."
-
     def _execute_gpt(self) -> list[dict]:
         api_key: str = self._get_api_key()
         client = OpenAI(
             api_key=api_key if api_key else os.getenv("OPENAI_API_KEY"))
         extracted: list[tuple] = []
-        batched_summaries = self._batch_summaries()
-        for batch_idx, batch in enumerate(batched_summaries, 1):
+        batches = self._batch_summaries()
+        for batch_idx, batch in enumerate(batches, 1):
             if batch_idx >= self.start_batch:
                 print(f"Processing batch {
                       batch_idx} [Start batch was {self.start_batch}]")
@@ -207,7 +203,7 @@ class GPTDataProcessor:
                     for result_dict in results[0]['response']:
                         extracted.append(result_dict)
                         batch_for_cache.append(result_dict)
-                    if len(batch_for_cache) < self.batch_size:
+                    if len(batch_for_cache) < len(batch):
                         raise Exception(f"""Error processing the batch: The batch size was {
                                         self.batch_size} but there were only {len(batch_for_cache)} records returned.""")
                     self._write_to_cache(
@@ -374,9 +370,10 @@ class GPTDataProcessor:
 
 def main() -> None:
     MODEL_VERSION = 'v7'
-    GPT_MODEL = 'gpt-4o'  # gpt-4-turbo-2024-04-09
+    #GPT_MODEL = 'gpt-4o'
+    GPT_MODEL = 'gpt-4-turbo'
     SAMPLE_MODE = True  # False processes entire population!
-    SAMPLE_SIZE = 15
+    SAMPLE_SIZE = 25
     BATCH_SIZE = 5
     BATCH_WAIT_TIME = 5  # time to wait between batches (secs)
     START_BATCH = 1  # start at batch number. Set 1 to start at beginning!
