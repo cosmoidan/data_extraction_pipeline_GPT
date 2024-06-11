@@ -72,6 +72,7 @@ class GPTDataProcessor:
     def __init__(self,
                  sample_size: int = 1,
                  sample_mode: bool = True,
+                 defined_sample: list[int] = [],
                  gpt_model: str = '',
                  model_version: str = 'v1',
                  batch_size: int = 1,
@@ -100,6 +101,7 @@ class GPTDataProcessor:
         self.model_version: str = model_version
         self.df: pd.DataFrame = None
         self.sample_size: int = sample_size
+        self.defined_sample: list[int] = defined_sample
         self.batch_size: int = batch_size
         self.sample_mode: bool = sample_mode
         self.model: str = gpt_model
@@ -219,8 +221,14 @@ class GPTDataProcessor:
 
     def _prepare_summaries(self, df: pd.DataFrame) -> None:
         if self.sample_mode:
-            self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
-                                                             ].dropna(how='any').sample(self.sample_size).values]
+            if self.defined_sample:
+                filtered = df[df[self.index_col_name].isin(
+                    self.defined_sample)]
+                self.summaries = [
+                    (col[0], col[1]) for col in filtered[[self.index_col_name, self.target_col_name]].values]
+            else:
+                self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]].dropna(
+                    how='any').sample(self.sample_size).values]
         else:
             self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
                                                              ].dropna(how='any').values]
@@ -262,11 +270,11 @@ class GPTDataProcessor:
         manual_values = []
         gpt_values = []
         success_values = []
-        try:
-            df: pd.DataFrame = self.extractions['dataframe']
-            df.dropna(how='any', inplace=True, subset=(
-                self.index_col_name, self.target_col_name))
-            for results in self.extractions['results']:
+        df: pd.DataFrame = self.extractions['dataframe']
+        df.dropna(how='any', inplace=True, subset=(
+            self.index_col_name, self.target_col_name))
+        for results in self.extractions['results']:
+            try:
                 record_ID = results[1]["record_id"]
                 manually_extracted = df.loc[df[self.index_col_name]
                                             == record_ID, self.validation_column_name].values[0]
@@ -282,17 +290,18 @@ class GPTDataProcessor:
                 else:
                     false_positive += 1
                     success_values.append(False)
-            validated: pd.DataFrame = pd.DataFrame({
-                'record_id': record_IDs,
-                'manual': manual_values,
-                'gpt': gpt_values,
-                'success': success_values,
-            },)
-            validated.sort_values(by='record_id', inplace=True)
-            validated.reset_index(drop=True, inplace=True)
-            self.validated = validated
-        except KeyError as e:
-            print(f'An error occurred during attempted data validation: {e}')
+                validated: pd.DataFrame = pd.DataFrame({
+                    'record_id': record_IDs,
+                    'manual': manual_values,
+                    'gpt': gpt_values,
+                    'success': success_values,
+                },)
+                validated.sort_values(by='record_id', inplace=True)
+                validated.reset_index(drop=True, inplace=True)
+                self.validated = validated
+            except (KeyError, TypeError) as e:
+                print(
+                    f'An error occurred during attempted data validation of record ID {record_ID}: {e}')
 
     def _write_to_cache(self, extractions, batch=False) -> None:
         if batch:
@@ -369,21 +378,24 @@ class GPTDataProcessor:
 
 
 def main() -> None:
-    MODEL_VERSION = 'v7'
-    #GPT_MODEL = 'gpt-4o'
-    GPT_MODEL = 'gpt-4-turbo'
-    SAMPLE_MODE = True  # False processes entire population!
-    SAMPLE_SIZE = 25
-    BATCH_SIZE = 5
-    BATCH_WAIT_TIME = 5  # time to wait between batches (secs)
-    START_BATCH = 1  # start at batch number. Set 1 to start at beginning!
-    RESPONSE_CHOICES = 1
+    MODEL_VERSION: str = 'v9'
+    #GPT_MODEL:str = 'gpt-4o'
+    GPT_MODEL: str = 'gpt-4-turbo'
+    SAMPLE_MODE: bool = False  # False processes entire population!
+    # list of record IDs for a pre-defined sample (SAMPLE_MODE has to be TRUE). Empty is random.
+    DEFINED_SAMPLE: list[int] = []
+    SAMPLE_SIZE: int = 50
+    BATCH_SIZE: int = 5
+    BATCH_WAIT_TIME: int = 5  # time to wait between batches (secs)
+    START_BATCH: int = 210  # start at batch number. Set 1 to start at beginning!
+    RESPONSE_CHOICES: int = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
     VALIDATION_COL_NAME: str = 'UAS ALT'
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
     END_SEPARATOR: str = '###'
-    CACHE_FILE: str = ''  # load final result set from cache. blank queries GPT!
+    # load final result set from cache. blank queries GPT!
+    CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v8/extractions/extractions_11_06_2024_01_57_12_916232.pkl'
     # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
     REBUILD_FROM_CACHE: bool = False
     BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
@@ -398,10 +410,11 @@ def main() -> None:
     OUTPUT_FORMAT: str = 'xlsx'
     VALIDATE: bool = True
     # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
-    PRINT_OUTPUT_OF_IDS = []
+    PRINT_OUTPUT_OF_IDS: list[int] = []
 
     gpt = GPTDataProcessor(gpt_model=GPT_MODEL,
                            sample_mode=SAMPLE_MODE,
+                           defined_sample=DEFINED_SAMPLE,
                            sample_size=SAMPLE_SIZE,
                            model_version=MODEL_VERSION,
                            batch_size=BATCH_SIZE,
