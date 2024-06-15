@@ -12,7 +12,7 @@ from openai import OpenAI
 from openai import AssistantEventHandler
 from typing_extensions import override
 from pprint import pp
-from sys_prompts_v6 import SYSTEM_PROMPTS
+from sys_prompts_v10 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
 
@@ -81,6 +81,7 @@ class GPTDataProcessor:
                  index_col_name: str = '',
                  validation_col_name: str = '',
                  validation_json_field_name: str = '',
+                 additional_report_json_field_names: list[str] = [],
                  cache_file: str = '',
                  batch_cache_dir: str = 'cache',
                  extractions_cache_dir: str = 'cache/extractions',
@@ -97,6 +98,7 @@ class GPTDataProcessor:
                  batch_wait_time: int = 90,
                  start_batch: int = 1,
                  rebuild_from_cache: bool = False,
+                 batch_attempts: int = 5,
                  ):
         self.model_version: str = model_version
         self.df: pd.DataFrame = None
@@ -110,6 +112,7 @@ class GPTDataProcessor:
         self.index_col_name: str = index_col_name
         self.validation_column_name: str = validation_col_name
         self.validation_json_field_name: str = validation_json_field_name
+        self.additional_report_json_field_names: list[str] = additional_report_json_field_names
         self.batch_cache_dir: str = batch_cache_dir
         self.extractions_cache_dir: str = extractions_cache_dir
         self.cache_file: str = cache_file
@@ -130,6 +133,7 @@ class GPTDataProcessor:
         self.batch_wait_time: int = batch_wait_time
         self.start_batch: int = start_batch if start_batch != 0 else 1
         self.rebuild_from_cache: bool = rebuild_from_cache
+        self.batch_attempts: int = batch_attempts
 
     def _get_api_key(self) -> None:
         with open('OPENAI_API_KEY.txt', 'r') as key:
@@ -159,6 +163,7 @@ class GPTDataProcessor:
         except Exception as e:
             print("Error concatenating DataFrames!")
             print(e)
+        self._write_output_file(mode='all_input_data', input_df=df)
         return df
 
     def _build_prompts(self, batch: list[tuple]) -> list[dict]:
@@ -187,36 +192,46 @@ class GPTDataProcessor:
         extracted: list[tuple] = []
         batches = self._batch_summaries()
         for batch_idx, batch in enumerate(batches, 1):
-            if batch_idx >= self.start_batch:
-                print(f"Processing batch {
-                      batch_idx} [Start batch was {self.start_batch}]")
-                batch_for_cache: list = []
-                response = client.chat.completions.create(
-                    model=self.model,
-                    response_format={"type": "json_object"},
-                    messages=self._build_prompts(batch=batch),
-                    n=self.response_choices,
-                    max_tokens=4096,
-                )
-                json_results = [c.message.content for c in response.choices]
+            attempt_counter = 0
+            batch_success = False
+            while not batch_success and attempt_counter < self.batch_attempts:
                 try:
-                    results: list[tuple] = [
-                        json.loads(r) for r in json_results]
-                    for result_dict in results[0]['response']:
-                        extracted.append(result_dict)
-                        batch_for_cache.append(result_dict)
-                    if len(batch_for_cache) < len(batch):
-                        raise Exception(f"""Error processing the batch: The batch size was {
-                                        self.batch_size} but there were only {len(batch_for_cache)} records returned.""")
-                    self._write_to_cache(
-                        extractions=batch_for_cache, batch=True)
+                    if batch_idx >= self.start_batch:
+                        print(f"Processing batch {
+                            batch_idx} [Start batch was {self.start_batch}]")
+                        batch_for_cache: list = []
+                        response = client.chat.completions.create(
+                            model=self.model,
+                            response_format={"type": "json_object"},
+                            messages=self._build_prompts(batch=batch),
+                            n=self.response_choices,
+                            max_tokens=4096,
+                            temperature=0.0
+                        )
+                        json_results = [
+                            c.message.content for c in response.choices]
+                        results: list[tuple] = [
+                            json.loads(r) for r in json_results]
+                        for result_dict in results[0]['response']:
+                            extracted.append(result_dict)
+                            batch_for_cache.append(result_dict)
+                        if len(batch_for_cache) < len(batch):
+                            raise Exception(f"""Error processing the batch: The batch size was {
+                                            self.batch_size} but there were only {len(batch_for_cache)} records returned.""")
+                        else:
+                            self._write_to_cache(
+                                extractions=batch_for_cache, batch=True)
+                            batch_success = True
+                            attempt_counter = 0
                 except Exception as e:
-                    print(f"""An error occurred while requesting batch {
+                    print(f"""Attempt {attempt_counter + 1} failed! An error occurred while requesting batch {
                         batch_idx}. The error was: {e}""")
-                    raise Exception(f"""Error processing batch: {batch_idx}.
-                                    Error details: {e}.
-                                    Batch content: {batch}""")
-                time.sleep(self.batch_wait_time)
+                    extracted.pop()
+                    attempt_counter += 1
+            if not batch_success:
+                raise Exception(
+                    f'An unresolvable error occurred while processing the batch {batch_idx}')
+            time.sleep(self.batch_wait_time)
         return extracted
 
     def _prepare_summaries(self, df: pd.DataFrame) -> None:
@@ -246,7 +261,6 @@ class GPTDataProcessor:
                     if self.rebuild_from_cache:
                         results: list[dict] = self._rebuild_from_cache()
                     else:
-                        # hit the api
                         results: list[dict] = self._execute_gpt()
                     if len(results) != len(self.summaries):
                         print(
@@ -261,15 +275,19 @@ class GPTDataProcessor:
                     self._write_to_cache(extractions, batch=False)
         except FileNotFoundError as e:
             print('Cached file not found!')
+            raise Exception('Exit')
+        except Exception as e:
+            print(e)
+            raise Exception('Exit')
         self.extractions = extractions
 
     def _validate_extractions(self):
-        true_positive = 0
-        false_positive = 0
-        record_IDs = []
-        manual_values = []
-        gpt_values = []
-        success_values = []
+        record_IDs: list[int] = []
+        manual_values: list = []
+        gpt_values: list = []
+        success_values: list = []
+        additional_values: list = []
+        additional_values_dict: dict = dict()
         df: pd.DataFrame = self.extractions['dataframe']
         df.dropna(how='any', inplace=True, subset=(
             self.index_col_name, self.target_col_name))
@@ -285,23 +303,29 @@ class GPTDataProcessor:
                 manual_values.append(manually_extracted)
                 gpt_values.append(gpt_extracted)
                 if manually_extracted == gpt_extracted:
-                    true_positive += 1
                     success_values.append(True)
                 else:
-                    false_positive += 1
                     success_values.append(False)
-                validated: pd.DataFrame = pd.DataFrame({
-                    'record_id': record_IDs,
-                    'manual': manual_values,
-                    'gpt': gpt_values,
-                    'success': success_values,
-                },)
-                validated.sort_values(by='record_id', inplace=True)
-                validated.reset_index(drop=True, inplace=True)
-                self.validated = validated
+                for field in self.additional_report_json_field_names:
+                    additional_values.append(
+                        results[1][field] if field in results[1] else False)
+                    additional_values_dict.update({field: additional_values})
             except (KeyError, TypeError) as e:
                 print(
                     f'An error occurred during attempted data validation of record ID {record_ID}: {e}')
+        validated: pd.DataFrame = pd.DataFrame({
+            'record_id': record_IDs,
+            'manual': manual_values,
+            'gpt': gpt_values,
+            'success': success_values,
+        },)
+        for field, value_list in additional_values_dict.items():
+            validated[field] = value_list
+        validated = validated[['record_id', 'manual', 'gpt', ' ,'.join(
+            [k for k in additional_values_dict.keys()]), 'success']]
+        validated.sort_values(by='record_id', inplace=True)
+        validated.reset_index(drop=True, inplace=True)
+        self.validated = validated
 
     def _write_to_cache(self, extractions, batch=False) -> None:
         if batch:
@@ -349,7 +373,7 @@ class GPTDataProcessor:
             except KeyError:
                 pass
 
-    def _write_output_file(self, mode=None) -> None:
+    def _write_output_file(self, mode: str = None, input_df: pd.DataFrame = None) -> None:
         if mode == 'validate' and not self.validated.empty:
             if self.output_format == 'xlsx':
                 self.validated.to_excel(
@@ -365,37 +389,49 @@ class GPTDataProcessor:
                 )
             else:
                 pass  #  can add additional output formats here
+        elif mode == 'all_input_data':
+            output = input_df[[self.index_col_name, self.target_col_name]]
+            output = output.sort_values(
+                by=self.index_col_name, ascending=True)
+            output.to_excel(
+                Path(self.output_dir) / (f'input_data_for_{self.output_filename}' + '.xlsx'), index=False
+            )
         else:
-            pass  # can write non-validation output here
+            pass  # can write more output modes here
 
     def execute(self) -> None:
-        self._extract_data()
-        if self.validate:
-            self._validate_extractions()
-        self._print_results()
-        self._write_output_file(
-            mode='validate' if self.validate else None)
+        try:
+            self._extract_data()
+            if self.validate:
+                self._validate_extractions()
+            self._print_results()
+            self._write_output_file(
+                mode='validate' if self.validate else None)
+        except Exception as e:
+            print(e)
 
 
 def main() -> None:
-    MODEL_VERSION: str = 'v9'
-    #GPT_MODEL:str = 'gpt-4o'
+    MODEL_VERSION: str = 'v10'  # ideally should correspond to sys_prompts version
+    # GPT_MODEL:str = 'gpt-4o'
     GPT_MODEL: str = 'gpt-4-turbo'
-    SAMPLE_MODE: bool = False  # False processes entire population!
+    SAMPLE_MODE: bool = True  # False processes entire population!
     # list of record IDs for a pre-defined sample (SAMPLE_MODE has to be TRUE). Empty is random.
     DEFINED_SAMPLE: list[int] = []
-    SAMPLE_SIZE: int = 50
-    BATCH_SIZE: int = 5
+    SAMPLE_SIZE: int = 2
+    BATCH_SIZE: int = 1
     BATCH_WAIT_TIME: int = 5  # time to wait between batches (secs)
-    START_BATCH: int = 210  # start at batch number. Set 1 to start at beginning!
+    START_BATCH: int = 1  # start at batch number. Set 1 to start at beginning!
+    BATCH_ATTEMPTS: int = 5  # attempts to process batch in event of error
     RESPONSE_CHOICES: int = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
     VALIDATION_COL_NAME: str = 'UAS ALT'
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
+    ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = ['no_ac_involved']
     END_SEPARATOR: str = '###'
     # load final result set from cache. blank queries GPT!
-    CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v8/extractions/extractions_11_06_2024_01_57_12_916232.pkl'
+    CACHE_FILE: str = ''
     # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
     REBUILD_FROM_CACHE: bool = False
     BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
@@ -403,7 +439,7 @@ def main() -> None:
     EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
     INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
     OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
-    OUTPUT_FILENAME: str = f'gtp4o_3d_db_{MODEL_VERSION}'
+    OUTPUT_FILENAME: str = f'gtp4T_3d_db_{MODEL_VERSION}'
     SUMMARIES_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
     SUMMARIES_FILE: str = 'summaries'
     SUMMARIES_FORMAT: str = 'xlsx'
@@ -423,6 +459,7 @@ def main() -> None:
                            index_col_name=INDEX_COL_NAME,
                            validation_col_name=VALIDATION_COL_NAME,
                            validation_json_field_name=VALIDATION_JSON_FIELD_NAME,
+                           additional_report_json_field_names=ADDITIONAL_REPORT_JSON_FIELD_NAMES,
                            cache_file=CACHE_FILE,
                            batch_cache_dir=BATCH_CACHE_DIR,
                            extractions_cache_dir=EXTRACTIONS_CACHE_DIR,
@@ -439,6 +476,7 @@ def main() -> None:
                            batch_wait_time=BATCH_WAIT_TIME,
                            start_batch=START_BATCH,
                            rebuild_from_cache=REBUILD_FROM_CACHE,
+                           batch_attempts=BATCH_ATTEMPTS,
                            )
     gpt.execute()
 
