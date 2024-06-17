@@ -221,17 +221,21 @@ class GPTDataProcessor:
                         else:
                             self._write_to_cache(
                                 extractions=batch_for_cache, batch=True)
-                            batch_success = True
                             attempt_counter = 0
+                            batch_success = True
+                            time.sleep(self.batch_wait_time)
+                    else:  #  batch previously completed as start_batch was set
+                        attempt_counter = 0
+                        batch_success = True
                 except Exception as e:
                     print(f"""Attempt {attempt_counter + 1} failed! An error occurred while requesting batch {
                         batch_idx}. The error was: {e}""")
                     extracted.pop()
                     attempt_counter += 1
+                    time.sleep(self.batch_wait_time)
             if not batch_success:
                 raise Exception(
                     f'An unresolvable error occurred while processing the batch {batch_idx}')
-            time.sleep(self.batch_wait_time)
         return extracted
 
     def _prepare_summaries(self, df: pd.DataFrame) -> None:
@@ -286,7 +290,7 @@ class GPTDataProcessor:
         manual_values: list = []
         gpt_values: list = []
         success_values: list = []
-        additional_values: list = []
+        additional_values: dict = dict()
         additional_values_dict: dict = dict()
         df: pd.DataFrame = self.extractions['dataframe']
         df.dropna(how='any', inplace=True, subset=(
@@ -307,9 +311,12 @@ class GPTDataProcessor:
                 else:
                     success_values.append(False)
                 for field in self.additional_report_json_field_names:
-                    additional_values.append(
+                    if field not in additional_values.keys():
+                        additional_values[field] = []
+                    additional_values[field].append(
                         results[1][field] if field in results[1] else False)
-                    additional_values_dict.update({field: additional_values})
+                    additional_values_dict.update(
+                        {field: additional_values[field]})
             except (KeyError, TypeError) as e:
                 print(
                     f'An error occurred during attempted data validation of record ID {record_ID}: {e}')
@@ -321,8 +328,8 @@ class GPTDataProcessor:
         },)
         for field, value_list in additional_values_dict.items():
             validated[field] = value_list
-        validated = validated[['record_id', 'manual', 'gpt', ' ,'.join(
-            [k for k in additional_values_dict.keys()]), 'success']]
+        validated = validated[['record_id', 'manual', 'gpt'] +
+                              self.additional_report_json_field_names + ['success']]
         validated.sort_values(by='record_id', inplace=True)
         validated.reset_index(drop=True, inplace=True)
         self.validated = validated
@@ -418,21 +425,22 @@ def main() -> None:
     SAMPLE_MODE: bool = True  # False processes entire population!
     # list of record IDs for a pre-defined sample (SAMPLE_MODE has to be TRUE). Empty is random.
     DEFINED_SAMPLE: list[int] = []
-    SAMPLE_SIZE: int = 2
-    BATCH_SIZE: int = 1
+    SAMPLE_SIZE: int = 5
+    BATCH_SIZE: int = 5
     BATCH_WAIT_TIME: int = 5  # time to wait between batches (secs)
-    START_BATCH: int = 1  # start at batch number. Set 1 to start at beginning!
+    START_BATCH: int = 81  # start at batch number. Set 1 to start at beginning!
     BATCH_ATTEMPTS: int = 5  # attempts to process batch in event of error
     RESPONSE_CHOICES: int = 1
     TARGET_COL_NAME: str = 'CLEANED Summary'
     INDEX_COL_NAME: str = 'RecNum'
     VALIDATION_COL_NAME: str = 'UAS ALT'
     VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
-    ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = ['no_ac_involved']
+    ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
+        'no_ac_involved', 'multiple_events']
     END_SEPARATOR: str = '###'
     # load final result set from cache. blank queries GPT!
-    CACHE_FILE: str = ''
-    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache. For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
+    CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_15_06_2024_21_58_55_711864.pkl'
+    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache (& GPT API call is not executed). For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
     REBUILD_FROM_CACHE: bool = False
     BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
         MODEL_VERSION}/'
@@ -446,7 +454,7 @@ def main() -> None:
     OUTPUT_FORMAT: str = 'xlsx'
     VALIDATE: bool = True
     # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
-    PRINT_OUTPUT_OF_IDS: list[int] = []
+    PRINT_OUTPUT_OF_IDS: list[int] = [1090]
 
     gpt = GPTDataProcessor(gpt_model=GPT_MODEL,
                            sample_mode=SAMPLE_MODE,
