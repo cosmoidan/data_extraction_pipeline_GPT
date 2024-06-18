@@ -7,6 +7,9 @@ Description:
     - A data extraction pipeline for GPT
         * loads and outputs data from excel format spreadsheets (.xlsx)
         * Extracts features as described by user-engineered prompts
+        * batches requests (user defined)
+        * caches responses (inferences)
+        * rebuilds responses from cache (if required)
         * validates extractions against hand-curated validation data
 Usage:
     1) Define config parameters in main()
