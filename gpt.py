@@ -5,7 +5,6 @@ import pandas as pd
 import os
 from pathlib import Path
 import json
-from collections import defaultdict
 import time
 from datetime import datetime as dt
 from openai import OpenAI
@@ -145,7 +144,6 @@ class GPTDataProcessor:
         if not files:
             print("No files found in the specified directory.")
         dfs: list[pd.DataFrame] = []
-        dfs_by_cols: defaultdict = defaultdict(list)
         for file in files:
             try:
                 df = pd.read_excel(file, engine="openpyxl")
@@ -154,16 +152,14 @@ class GPTDataProcessor:
                 print(e)
                 continue
             dfs.append(df)
-        for k, v in dfs_by_cols.items():
-            print(k, len(v))
         if not dfs:
             print("No files successfully read.")
         try:
             df = pd.concat(dfs, axis=0).reset_index(drop=True)
+            self._write_output_file(mode='all_input_data', input_df=df)
         except Exception as e:
             print("Error concatenating DataFrames!")
             print(e)
-        self._write_output_file(mode='all_input_data', input_df=df)
         return df
 
     def _build_prompts(self, batch: list[tuple]) -> list[dict]:
