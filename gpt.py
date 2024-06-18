@@ -55,9 +55,9 @@ class GPTDataProcessor:
                  end_separator: str = '###',
                  validate: bool = False,
                  print_output_of_ids: list[int] = [],
-                 summaries_dir: str = 'tmp_data',
-                 summaries_file: str = 'summaries',
-                 summaries_format: str = 'xlsx',
+                 raw_input_text_output_dir: str = 'tmp_data',
+                 raw_input_text_output_file: str = 'summaries',
+                 raw_input_text_output_format: str = 'xlsx',
                  batch_wait_time: int = 90,
                  start_batch: int = 1,
                  rebuild_from_cache: bool = False,
@@ -87,10 +87,10 @@ class GPTDataProcessor:
         self.validate: bool = validate
         self.validated: pd.DataFrame = pd.DataFrame()
         self.print_output_of_ids: list[int] = print_output_of_ids
-        self.summaries: list[tuple] = []
-        self.summaries_dir: str = summaries_dir
-        self.summaries_file: str = summaries_file
-        self.summaries_format: str = summaries_format
+        self.raw_input_text: list[tuple] = []
+        self.raw_input_text_output_dir: str = raw_input_text_output_dir
+        self.raw_input_text_output_file: str = raw_input_text_output_file
+        self.raw_input_text_output_format: str = raw_input_text_output_format
         self.assistant_results: list = []
         self.end_separator: str = end_separator
         self.batch_wait_time: int = batch_wait_time
@@ -141,8 +141,9 @@ class GPTDataProcessor:
 
     def _batch_summaries(self) -> list[list[tuple]]:
         batched_summaries: list = []
-        for i in range(0, len(self.summaries), self.batch_size):
-            batched_summaries.append(self.summaries[i:i + self.batch_size])
+        for i in range(0, len(self.raw_input_text), self.batch_size):
+            batched_summaries.append(
+                self.raw_input_text[i:i + self.batch_size])
         return batched_summaries
 
     def _execute_gpt(self) -> list[dict]:
@@ -203,14 +204,14 @@ class GPTDataProcessor:
             if self.defined_sample:
                 filtered = df[df[self.index_col_name].isin(
                     self.defined_sample)]
-                self.summaries = [
+                self.raw_input_text = [
                     (col[0], col[1]) for col in filtered[[self.index_col_name, self.target_col_name]].values]
             else:
-                self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]].dropna(
+                self.raw_input_text = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]].dropna(
                     how='any').sample(self.sample_size).values]
         else:
-            self.summaries = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
-                                                             ].dropna(how='any').values]
+            self.raw_input_text = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
+                                                                  ].dropna(how='any').values]
 
     def _extract_data(self) -> None:
         extractions: dict = dict()
@@ -226,12 +227,12 @@ class GPTDataProcessor:
                         results: list[dict] = self._rebuild_from_cache()
                     else:
                         results: list[dict] = self._execute_gpt()
-                    if len(results) != len(self.summaries):
+                    if len(results) != len(self.raw_input_text):
                         print(
                             "Error extracting JSON data. Summary and response sizes do not match."
                         )
                         return None
-                    for summary in self.summaries:
+                    for summary in self.raw_input_text:
                         extractions['results'].append(
                             (summary, next((d for d in results if d.get("record_id") == summary[0]), None)))
                     extractions['dataframe'] = df.dropna(how='any', subset=(
@@ -348,11 +349,11 @@ class GPTDataProcessor:
             else:
                 pass  #  can add additional output formats here
         elif mode == 'summaries':
-            df: pd.DataFrame = pd.DataFrame(self.summaries, columns=[
+            df: pd.DataFrame = pd.DataFrame(self.raw_input_text, columns=[
                                             self.index_col_name, self.target_col_name])
-            if self.summaries_format == 'xlsx':
+            if self.raw_input_text_output_format == 'xlsx':
                 df.to_excel(
-                    Path(self.summaries_dir) / (self.summaries_file + '.xlsx'), index=False
+                    Path(self.raw_input_text_output_dir) / (self.raw_input_text_output_file + '.xlsx'), index=False
                 )
             else:
                 pass  #  can add additional output formats here
@@ -363,6 +364,9 @@ class GPTDataProcessor:
             output.to_excel(
                 Path(self.output_dir) / (f'input_data_for_{self.output_filename}' + '.xlsx'), index=False
             )
+        elif mode == 'model_exe':
+            # print statement is holding code; output results file here
+            pp(self.extractions['results'])
         else:
             pass  # can write more output modes here
 
@@ -408,11 +412,11 @@ def main() -> None:
     INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
     OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
     OUTPUT_FILENAME: str = f'gtp4T_3d_db_{MODEL_VERSION}'
-    SUMMARIES_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
-    SUMMARIES_FILE: str = 'summaries'
-    SUMMARIES_FORMAT: str = 'xlsx'
+    RAW_INPUT_TEXT_OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
+    RAW_INPUT_TEXT_OUTPUT_FILE: str = 'summaries'
+    RAW_INPUT_TEXT_OUTPUT_FORMAT: str = 'xlsx'
     OUTPUT_FORMAT: str = 'xlsx'
-    VALIDATE: bool = True
+    VALIDATE: bool = False
     # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
     PRINT_OUTPUT_OF_IDS: list[int] = [1090]
 
@@ -437,9 +441,9 @@ def main() -> None:
                            output_format=OUTPUT_FORMAT,
                            validate=VALIDATE,
                            print_output_of_ids=PRINT_OUTPUT_OF_IDS,
-                           summaries_file=SUMMARIES_FILE,
-                           summaries_dir=SUMMARIES_DIR,
-                           summaries_format=SUMMARIES_FORMAT,
+                           raw_input_text_output_file=RAW_INPUT_TEXT_OUTPUT_FILE,
+                           raw_input_text_output_dir=RAW_INPUT_TEXT_OUTPUT_DIR,
+                           raw_input_text_output_format=RAW_INPUT_TEXT_OUTPUT_FORMAT,
                            end_separator=END_SEPARATOR,
                            batch_wait_time=BATCH_WAIT_TIME,
                            start_batch=START_BATCH,
