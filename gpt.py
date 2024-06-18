@@ -1,5 +1,18 @@
-import requests
-import bs4
+"""
+Author: Dan Bright, cosmoid@tutu.io
+License: GPLv3.0
+Version: 1.0
+First published: 18 June 2024
+Description: 
+    - A data extraction pipeline for GPT
+        * loads and outputs data from excel format spreadsheets (.xlsx)
+        * Extracts features as described by user-engineered prompts
+        * validates extractions against hand-curated validation data
+Usage:
+    1) Define config parameters in main()
+    2) Run script: python gpt.py
+"""
+
 import pickle
 import pandas as pd
 import os
@@ -8,63 +21,11 @@ import json
 import time
 from datetime import datetime as dt
 from openai import OpenAI
-from openai import AssistantEventHandler
 from typing_extensions import override
 from pprint import pp
 from sys_prompts_v10 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
-
-
-class FAADataDownloader:
-
-    def __init__(self, buffer_time: int = 10, data_dir: Path = None):
-        if buffer_time < 10:
-            raise ValueError(
-                "Buffer time must be at least 10 seconds for this scraper."
-            )
-        self.buffer_time = buffer_time
-        self.base = "https://www.faa.gov"
-        self.faa_drone_report_url = (
-            "https://www.faa.gov/uas/resources/public_records/uas_sightings_report"
-        )
-        self.data_dir: Path = data_dir
-
-    def execute(self) -> None:
-        if self.data_dir:
-            self._get_file_links()
-            self._download_files()
-        else:
-            print('Please specify a data download directory.')
-
-    def _get_file_links(self):
-        response = requests.get(self.faa_drone_report_url)
-        response.raise_for_status()
-        soup = bs4.BeautifulSoup(response.content, "html.parser")
-        links = soup.find_all("a")
-        file_links = [
-            self.base + link["href"]
-            for link in links
-            if link.text.startswith("Reported UAS Sightings")
-        ]
-        return file_links
-
-    def _download_files(self):
-        file_links = self.get_file_links()
-        for idx, link in enumerate(file_links):
-            response = requests.get(link)
-            response.raise_for_status()
-            ftype = link.split(".")[-1]
-            if not ftype.startswith("x"):
-                print(f"Cannot download link {link}. Skipping.")
-                continue
-            pth = Path(os.getcwd()) / self.data_dir / \
-                f"uas_sightings_report_{idx}.{ftype}"
-            with open(pth, "wb") as f:
-                f.write(response.content)
-            print(f"Downloaded file: {pth}")
-            time.sleep(self.buffer_time)
-        print("Download complete.")
 
 
 class GPTDataProcessor:
