@@ -4,16 +4,34 @@ License: GPLv3.0
 Version: 1.0
 First published: 18 June 2024
 Description: 
-    - A data extraction pipeline for GPT
-        * loads and outputs data from excel format spreadsheets (.xlsx)
-        * Extracts features as described by user-engineered prompts
-        * batches requests (user defined)
-        * caches responses (inferences)
-        * rebuilds responses from cache (if required)
-        * validates extractions against hand-curated validation data
+    A data extraction pipeline for GPT:
+    - loads and outputs data from excel format spreadsheets (.xlsx)
+    - Extracts features as described by user-engineered prompts
+    - batches requests (user defined)
+    - caches responses (inferences)
+    - rebuilds responses from cache (if required)
+    - validates extractions against hand-curated validation data
 Usage:
     1) Define config parameters in main()
     2) Run script: python gpt.py
+Configuration Notes:
+    - MODEL_VERSION: Ideally should correspond to sys_prompts version.
+    - SAMPLE_MODE: False processes entire population!
+    - DEFINED_SAMPLE: List of record IDs for a pre-defined sample 
+        (SAMPLE_MODE has to be TRUE). Empty is random.
+    - CACHE_FILE: Load final result set from this cache file. 
+        Empty queries GPT API.
+    - REBUILD_FROM_CACHE: If True, rebuilds final results set from 
+    cache (& GPT API call is not executed). For use in case of 
+    resumption after API failure. Note, input data in INPUT_DATA_DIR
+    *HAS* to be identical! Also, does not work with sample!
+    - BATCH_WAIT_TIME: Time to wait between batches (secs).
+    - START_BATCH: Start at batch number. Set 1 to start at beginning.
+    - BATCH_ATTEMPTS: Attempts to process batch in event of error.
+    - PRINT_OUTPUT_OF_IDS: 0 to print results for ALL records, 
+        empty for None, list of IDs to print only results for those IDs
+    - PRIMARY_DATA: An excel spreadsheet to update with the extracted values. 
+    Only needs setting if EXECUTING model (not validation).
 """
 
 import pickle
@@ -29,6 +47,40 @@ from pprint import pp
 from sys_prompts_v10 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
+
+MODEL_VERSION: str = 'v10'
+# GPT_MODEL:str = 'gpt-4o'
+GPT_MODEL: str = 'gpt-4-turbo'
+SAMPLE_MODE: bool = True
+DEFINED_SAMPLE: list[int] = []
+SAMPLE_SIZE: int = 5
+BATCH_SIZE: int = 5
+BATCH_WAIT_TIME: int = 5
+START_BATCH: int = 81
+BATCH_ATTEMPTS: int = 5
+RESPONSE_CHOICES: int = 1
+TARGET_COL_NAME: str = 'CLEANED Summary'
+INDEX_COL_NAME: str = 'RecNum'
+VALIDATION_COL_NAME: str = 'UAS ALT'
+VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
+ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
+    'no_ac_involved', 'multiple_events']
+END_SEPARATOR: str = '###'
+CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_15_06_2024_21_58_55_711864.pkl'
+REBUILD_FROM_CACHE: bool = False
+BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
+    MODEL_VERSION}/'
+EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
+INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
+PRIMARY_DATA: str = '/Users/dan/Dev/scu/InformationExtraction/archive/raw_data/WIP_VERSION_3d_DB.xlsx'
+OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
+OUTPUT_FILENAME: str = f'model_exe_gtp4T_3d_db_{MODEL_VERSION}'
+RAW_INPUT_TEXT_OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
+RAW_INPUT_TEXT_OUTPUT_FILE: str = 'summaries'
+RAW_INPUT_TEXT_OUTPUT_FORMAT: str = 'xlsx'
+OUTPUT_FORMAT: str = 'xlsx'
+VALIDATE: bool = False
+PRINT_OUTPUT_OF_IDS: list[int] = []
 
 
 class GPTDataProcessor:
@@ -62,9 +114,12 @@ class GPTDataProcessor:
                  start_batch: int = 1,
                  rebuild_from_cache: bool = False,
                  batch_attempts: int = 5,
+                 primary_data: str = ''
                  ):
         self.model_version: str = model_version
+        self.original_data_df: pd.DataFrame = None
         self.df: pd.DataFrame = None
+        self.primary_data: str = primary_data
         self.sample_size: int = sample_size
         self.defined_sample: list[int] = defined_sample
         self.batch_size: int = batch_size
@@ -102,9 +157,12 @@ class GPTDataProcessor:
         with open('OPENAI_API_KEY.txt', 'r') as key:
             return key.read()
 
-    def _read_files(self) -> pd.DataFrame:
+    def _read_files(self, single='') -> pd.DataFrame:
         df: pd.DataFrame = pd.DataFrame()
-        files: list[Path] = list(Path(self.data_dir).glob("*.xlsx"))
+        if single:
+            files: list[Path] = [Path(single)]
+        else:
+            files: list[Path] = list(Path(self.data_dir).glob("*.xlsx"))
         if not files:
             print("No files found in the specified directory.")
         dfs: list[pd.DataFrame] = []
@@ -119,12 +177,12 @@ class GPTDataProcessor:
         if not dfs:
             print("No files successfully read.")
         try:
-            df = pd.concat(dfs, axis=0).reset_index(drop=True)
-            self._write_output_file(mode='all_input_data', input_df=df)
+            self.original_data_df = pd.concat(
+                dfs, axis=0).reset_index(drop=True)
+            self._write_output_file(mode='all_input_data')
         except Exception as e:
             print("Error concatenating DataFrames!")
             print(e)
-        return df
 
     def _build_prompts(self, batch: list[tuple]) -> list[dict]:
         summary_prompts = USER_PROMPTS.copy()
@@ -199,7 +257,8 @@ class GPTDataProcessor:
                     f'An unresolvable error occurred while processing the batch {batch_idx}')
         return extracted
 
-    def _prepare_summaries(self, df: pd.DataFrame) -> None:
+    def _prepare_summaries(self) -> None:
+        df = self.original_data_df
         if self.sample_mode:
             if self.defined_sample:
                 filtered = df[df[self.index_col_name].isin(
@@ -220,9 +279,9 @@ class GPTDataProcessor:
             if self.cache_file:
                 extractions = self._load_extractions_from_cache()
             else:
-                df = self._read_files()
-                if not df.empty:
-                    self._prepare_summaries(df=df)
+                self._read_files()
+                if not self.original_data_df.empty:
+                    self._prepare_summaries()
                     if self.rebuild_from_cache:
                         results: list[dict] = self._rebuild_from_cache()
                     else:
@@ -235,7 +294,7 @@ class GPTDataProcessor:
                     for summary in self.raw_input_text:
                         extractions['results'].append(
                             (summary, next((d for d in results if d.get("record_id") == summary[0]), None)))
-                    extractions['dataframe'] = df.dropna(how='any', subset=(
+                    extractions['dataframe'] = self.original_data_df.dropna(how='any', subset=(
                         self.index_col_name, self.target_col_name))
                     self._write_to_cache(extractions, batch=False)
         except FileNotFoundError as e:
@@ -319,6 +378,19 @@ class GPTDataProcessor:
                 extracted += (pickle.load(fp))
         return extracted
 
+    def _merge_dfs(self, primary: pd.DataFrame = None, to_merge: list[pd.DataFrame] = None,
+                   merge_index='', primary_index='', copy_all=False) -> pd.DataFrame:
+        for update_df in to_merge:
+            update_dict: dict = update_df.set_index(
+                merge_index).to_dict('index')
+            for index, updates in update_dict.items():
+                for col, val in updates.items():
+                    if col in primary or copy_all:
+                        primary.loc[primary[primary_index]
+                                    == index, col] = val
+        primary.sort_values(by=primary_index, inplace=True)
+        return primary
+
     def _print_results(self) -> None:
         if self.print_output_of_ids:
             if self.print_output_of_ids[0] == 0:
@@ -358,15 +430,27 @@ class GPTDataProcessor:
             else:
                 pass  #  can add additional output formats here
         elif mode == 'all_input_data':
-            output = input_df[[self.index_col_name, self.target_col_name]]
+            output = self.original_data_df[[
+                self.index_col_name, self.target_col_name]]
             output = output.sort_values(
                 by=self.index_col_name, ascending=True)
             output.to_excel(
                 Path(self.output_dir) / (f'input_data_for_{self.output_filename}' + '.xlsx'), index=False
             )
         elif mode == 'model_exe':
-            # print statement is holding code; output results file here
-            pp(self.extractions['results'])
+            self._read_files(single=self.primary_data)
+            results: pd.DataFrame = pd.DataFrame().from_dict(
+                [r[1] for r in self.extractions['results']])
+            merged = self._merge_dfs(primary=self.original_data_df,
+                                     to_merge=[results],
+                                     merge_index='record_id',
+                                     primary_index=self.index_col_name,
+                                     copy_all=True)
+            if self.output_format == 'xlsx':
+                merged.to_excel(
+                    Path(self.output_dir) / (self.output_filename + '.xlsx'), index=False)
+            else:
+                pass  #  can add additional output formats here
         else:
             pass  # can write more output modes here
 
@@ -377,49 +461,12 @@ class GPTDataProcessor:
                 self._validate_extractions()
             self._print_results()
             self._write_output_file(
-                mode='validate' if self.validate else None)
+                mode='validate' if self.validate else 'model_exe')
         except Exception as e:
             print(e)
 
 
 def main() -> None:
-    MODEL_VERSION: str = 'v10'  # ideally should correspond to sys_prompts version
-    # GPT_MODEL:str = 'gpt-4o'
-    GPT_MODEL: str = 'gpt-4-turbo'
-    SAMPLE_MODE: bool = True  # False processes entire population!
-    # list of record IDs for a pre-defined sample (SAMPLE_MODE has to be TRUE). Empty is random.
-    DEFINED_SAMPLE: list[int] = []
-    SAMPLE_SIZE: int = 5
-    BATCH_SIZE: int = 5
-    BATCH_WAIT_TIME: int = 5  # time to wait between batches (secs)
-    START_BATCH: int = 81  # start at batch number. Set 1 to start at beginning!
-    BATCH_ATTEMPTS: int = 5  # attempts to process batch in event of error
-    RESPONSE_CHOICES: int = 1
-    TARGET_COL_NAME: str = 'CLEANED Summary'
-    INDEX_COL_NAME: str = 'RecNum'
-    VALIDATION_COL_NAME: str = 'UAS ALT'
-    VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
-    ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
-        'no_ac_involved', 'multiple_events']
-    END_SEPARATOR: str = '###'
-    # load final result set from cache. blank queries GPT!
-    CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_15_06_2024_21_58_55_711864.pkl'
-    # REBUILD_FROM_CACHE: If True, rebuilds results set from cache (& GPT API call is not executed). For use in case of resumption after API failure. Note, input data in INPUT_DATA_DIR *HAS* to be identical! Also, does not work with sample!
-    REBUILD_FROM_CACHE: bool = False
-    BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
-        MODEL_VERSION}/'
-    EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
-    INPUT_DATA_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/data'
-    OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt'
-    OUTPUT_FILENAME: str = f'gtp4T_3d_db_{MODEL_VERSION}'
-    RAW_INPUT_TEXT_OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data'
-    RAW_INPUT_TEXT_OUTPUT_FILE: str = 'summaries'
-    RAW_INPUT_TEXT_OUTPUT_FORMAT: str = 'xlsx'
-    OUTPUT_FORMAT: str = 'xlsx'
-    VALIDATE: bool = False
-    # print_results: 0 for ALL records, empty for None, list of IDs for those IDs
-    PRINT_OUTPUT_OF_IDS: list[int] = [1090]
-
     gpt = GPTDataProcessor(gpt_model=GPT_MODEL,
                            sample_mode=SAMPLE_MODE,
                            defined_sample=DEFINED_SAMPLE,
@@ -449,6 +496,7 @@ def main() -> None:
                            start_batch=START_BATCH,
                            rebuild_from_cache=REBUILD_FROM_CACHE,
                            batch_attempts=BATCH_ATTEMPTS,
+                           primary_data=PRIMARY_DATA,
                            )
     gpt.execute()
 
