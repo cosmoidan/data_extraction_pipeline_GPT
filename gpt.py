@@ -12,8 +12,21 @@ Description:
     - rebuilds responses from cache (if required)
     - validates extractions against hand-curated validation data
 Usage:
-    1) Define config parameters in main()
-    2) Run script: python gpt.py
+    1) Define config parameters
+    2) Define sys_prompts and user_prompts. These are separate
+        python files that need to be created, named 'sys_prompts.py', 
+        'user_prompts.py' and 'user_prompts_end.py'. They may also be 
+        versioned, e.g., 'user_prompts_v02.py', however the import 
+        statements need to be defined accordingly.
+        These files contain the GPT prompts, and should be a list of dictionaries 
+        containing the prompts; one prompt for each dictionary, in the form:
+            * SYSTEM_PROMPTS = [{"role": "user", "content": "This is my system prompt that 
+        is prepended to every request"},]
+            * USER_PROMPTS = [{"role": "user", "content": "This is my user prompt that 
+        prepended to every request"},]
+            * USER_PROMPTS_END = [{"role": "user", "content": "This is my user end prompt 
+        which is appended to every request"},]
+    3) Run the script: python gpt.py
 Configuration Notes:
     - MODEL_VERSION: Ideally should correspond to sys_prompts version.
     - SAMPLE_MODE: False processes entire population!
