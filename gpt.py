@@ -21,12 +21,15 @@ Usage:
         These files contain the GPT prompts, and should be a list of dictionaries 
         containing the prompts; one prompt for each dictionary, in the form:
             * SYSTEM_PROMPTS = [{"role": "user", "content": "This is my system prompt that 
-        is prepended to every request"},]
+        is prepended to every request"},].
             * USER_PROMPTS = [{"role": "user", "content": "This is my user prompt that 
-        prepended to every request"},]
+        prepended to every request"},].
             * USER_PROMPTS_END = [{"role": "user", "content": "This is my user end prompt 
-        which is appended to every request"},]
-    3) Run the script: python gpt.py
+        which is appended to every request"},].
+    3) Add any custom symbolic functions for post-inference processing to 
+        the 'custom_symbolic.py' file. Note, if using custom symbolic processing, 
+        the CUSTOM_SYMBOLIC configuration parameter must be set to True.
+    4) Run the script: python gpt.py.
 Configuration Notes:
     - MODEL_VERSION: Ideally should correspond to sys_prompts version.
     - SAMPLE_MODE: False processes entire population!
@@ -43,8 +46,12 @@ Configuration Notes:
     - BATCH_ATTEMPTS: Attempts to process batch in event of error.
     - PRINT_OUTPUT_OF_IDS: 0 to print results for ALL records, 
         empty for None, list of IDs to print only results for those IDs
+    ADDITIONAL_REPORT_JSON_FIELD_NAMES: List of GPT inference's JSON field names
+        to include in the output spreadsheet in addition to the primary 
+        validation target extraction.
     - PRIMARY_DATA: An excel spreadsheet to update with the extracted values. 
     Only needs setting if EXECUTING model (not validation).
+    - CUSTOM_SYMBOLIC: Set to True if using custom symbolic post-inference processing
 """
 
 import pickle
@@ -60,16 +67,17 @@ from pprint import pp
 from sys_prompts_v10 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
+from custom_symbolic import CustomSymbolic
 
 MODEL_VERSION: str = 'v10'
 # GPT_MODEL:str = 'gpt-4o'
 GPT_MODEL: str = 'gpt-4-turbo'
 SAMPLE_MODE: bool = True
-DEFINED_SAMPLE: list[int] = []
+DEFINED_SAMPLE: list[int] = [149]
 SAMPLE_SIZE: int = 5
 BATCH_SIZE: int = 5
 BATCH_WAIT_TIME: int = 5
-START_BATCH: int = 81
+START_BATCH: int = 1
 BATCH_ATTEMPTS: int = 5
 RESPONSE_CHOICES: int = 1
 TARGET_COL_NAME: str = 'CLEANED Summary'
@@ -79,7 +87,7 @@ VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
 ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
     'no_ac_involved', 'multiple_events']
 END_SEPARATOR: str = '###'
-CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_15_06_2024_21_58_55_711864.pkl'
+CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_20_06_2024_15_22_02_016922_test.pkl'
 REBUILD_FROM_CACHE: bool = False
 BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
     MODEL_VERSION}/'
@@ -94,6 +102,7 @@ RAW_INPUT_TEXT_OUTPUT_FORMAT: str = 'xlsx'
 OUTPUT_FORMAT: str = 'xlsx'
 VALIDATE: bool = False
 PRINT_OUTPUT_OF_IDS: list[int] = []
+CUSTOM_SYMBOLIC: bool = True
 
 
 class GPTDataProcessor:
@@ -127,7 +136,8 @@ class GPTDataProcessor:
                  start_batch: int = 1,
                  rebuild_from_cache: bool = False,
                  batch_attempts: int = 5,
-                 primary_data: str = ''
+                 primary_data: str = '',
+                 custom_symbolic: bool = False,
                  ):
         self.model_version: str = model_version
         self.original_data_df: pd.DataFrame = None
@@ -165,6 +175,7 @@ class GPTDataProcessor:
         self.start_batch: int = start_batch if start_batch != 0 else 1
         self.rebuild_from_cache: bool = rebuild_from_cache
         self.batch_attempts: int = batch_attempts
+        self.custom_symbolic: bool = custom_symbolic
 
     def _get_api_key(self) -> None:
         with open('OPENAI_API_KEY.txt', 'r') as key:
@@ -291,6 +302,9 @@ class GPTDataProcessor:
         try:
             if self.cache_file:
                 extractions = self._load_extractions_from_cache()
+                if self.custom_symbolic:
+                    results = CustomSymbolic.zero_no_ac_involved(
+                        input=[r[1] for r in extractions['results']])
             else:
                 self._read_files()
                 if not self.original_data_df.empty:
@@ -300,10 +314,12 @@ class GPTDataProcessor:
                     else:
                         results: list[dict] = self._execute_gpt()
                     if len(results) != len(self.raw_input_text):
-                        print(
+                        raise Exception(
                             "Error extracting JSON data. Summary and response sizes do not match."
                         )
-                        return None
+                    if self.custom_symbolic:
+                        results = CustomSymbolic.zero_no_ac_involved(
+                            input=results)
                     for summary in self.raw_input_text:
                         extractions['results'].append(
                             (summary, next((d for d in results if d.get("record_id") == summary[0]), None)))
@@ -510,6 +526,7 @@ def main() -> None:
                            rebuild_from_cache=REBUILD_FROM_CACHE,
                            batch_attempts=BATCH_ATTEMPTS,
                            primary_data=PRIMARY_DATA,
+                           custom_symbolic=CUSTOM_SYMBOLIC,
                            )
     gpt.execute()
 
