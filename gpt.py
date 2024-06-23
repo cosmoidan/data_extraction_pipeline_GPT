@@ -73,9 +73,9 @@ MODEL_VERSION: str = 'v10'
 # GPT_MODEL:str = 'gpt-4o'
 GPT_MODEL: str = 'gpt-4-turbo'
 SAMPLE_MODE: bool = True
-DEFINED_SAMPLE: list[int] = [149]
-SAMPLE_SIZE: int = 5
-BATCH_SIZE: int = 5
+DEFINED_SAMPLE: list[int] = []
+SAMPLE_SIZE: int = 3
+BATCH_SIZE: int = 1
 BATCH_WAIT_TIME: int = 5
 START_BATCH: int = 1
 BATCH_ATTEMPTS: int = 5
@@ -87,7 +87,7 @@ VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
 ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
     'no_ac_involved', 'multiple_events']
 END_SEPARATOR: str = '###'
-CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_20_06_2024_15_22_02_016922_test.pkl'
+CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_23_06_2024_13_31_24_010853.pkl'
 REBUILD_FROM_CACHE: bool = False
 BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
     MODEL_VERSION}/'
@@ -293,18 +293,15 @@ class GPTDataProcessor:
                 self.raw_input_text = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]].dropna(
                     how='any').sample(self.sample_size).values]
         else:
-            self.raw_input_text = [(col[0], col[1]) for col in df[[self.index_col_name, self.target_col_name]
-                                                                  ].dropna(how='any').values]
+            self.raw_input_text = [(col[0], col[1]) for col in df[[
+                self.index_col_name, self.target_col_name]].dropna(how='any').values]
 
     def _extract_data(self) -> None:
         extractions: dict = dict()
         extractions['results'] = []
         try:
             if self.cache_file:
-                extractions = self._load_extractions_from_cache()
-                if self.custom_symbolic:
-                    results = CustomSymbolic.zero_no_ac_involved(
-                        input=[r[1] for r in extractions['results']])
+                self.extractions = self._load_extractions_from_cache()
             else:
                 self._read_files()
                 if not self.original_data_df.empty:
@@ -326,13 +323,13 @@ class GPTDataProcessor:
                     extractions['dataframe'] = self.original_data_df.dropna(how='any', subset=(
                         self.index_col_name, self.target_col_name))
                     self._write_to_cache(extractions, batch=False)
+                    self.extractions = extractions
         except FileNotFoundError as e:
             print('Cached file not found!')
             raise Exception('Exit')
         except Exception as e:
             print(e)
             raise Exception('Exit')
-        self.extractions = extractions
 
     def _validate_extractions(self):
         record_IDs: list[int] = []
@@ -409,14 +406,16 @@ class GPTDataProcessor:
 
     def _merge_dfs(self, primary: pd.DataFrame = None, to_merge: list[pd.DataFrame] = None,
                    merge_index='', primary_index='', copy_all=False) -> pd.DataFrame:
+        self.additional_report_json_field_names.append(
+            self.validation_json_field_name)
         for update_df in to_merge:
             update_dict: dict = update_df.set_index(
                 merge_index).to_dict('index')
             for index, updates in update_dict.items():
                 for col, val in updates.items():
-                    if col in primary or copy_all:
-                        primary.loc[primary[primary_index]
-                                    == index, col] = val
+                    if col in primary or (copy_all and
+                                          col in self.additional_report_json_field_names):
+                        primary.loc[primary[primary_index] == index, col] = val
         primary.sort_values(by=primary_index, inplace=True)
         return primary
 
