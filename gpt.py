@@ -51,7 +51,13 @@ Configuration Notes:
         validation target extraction.
     - PRIMARY_DATA: An excel spreadsheet to update with the extracted values. 
     Only needs setting if EXECUTING model (not validation).
-    - CUSTOM_SYMBOLIC: Set to True if using custom symbolic post-inference processing
+    - POST_PROCESS: Set to True if using custom (symbolic) post-inference processing
+    - EXPECTED_IDX_RANGE: Tuple start and end IDs expected under the column named 
+        INDEX_COL_NAME. This is used to validate successful processing of a sequence 
+        of records. Leave empty if not required.
+    - MISSING_IDS_FILE: Full path to csv file where missing IDs are logged. 
+        This is used to validate successful processing of a sequence of records. 
+        Leave blank if not required.
 """
 
 import pickle
@@ -67,16 +73,16 @@ from pprint import pp
 from sys_prompts_v10 import SYSTEM_PROMPTS
 from user_prompts_v1 import USER_PROMPTS
 from user_prompt_end_v2 import USER_PROMPTS_END
-from custom_symbolic import CustomSymbolic
+from post_process import PostProcess
 
 MODEL_VERSION: str = 'v10'
 # GPT_MODEL:str = 'gpt-4o'
 GPT_MODEL: str = 'gpt-4-turbo'
-SAMPLE_MODE: bool = True
+SAMPLE_MODE: bool = False
 DEFINED_SAMPLE: list[int] = []
 SAMPLE_SIZE: int = 3
-BATCH_SIZE: int = 1
-BATCH_WAIT_TIME: int = 5
+BATCH_SIZE: int = 15
+BATCH_WAIT_TIME: int = 3
 START_BATCH: int = 1
 BATCH_ATTEMPTS: int = 5
 RESPONSE_CHOICES: int = 1
@@ -84,11 +90,10 @@ TARGET_COL_NAME: str = 'CLEANED Summary'
 INDEX_COL_NAME: str = 'RecNum'
 VALIDATION_COL_NAME: str = 'UAS ALT'
 VALIDATION_JSON_FIELD_NAME: str = 'uas_altitude'
-ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = [
-    'no_ac_involved', 'multiple_events']
+ADDITIONAL_REPORT_JSON_FIELD_NAMES: list[str] = ['no_ac_involved']
 END_SEPARATOR: str = '###'
-CACHE_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/cache/v10/extractions/extractions_23_06_2024_13_31_24_010853.pkl'
-REBUILD_FROM_CACHE: bool = False
+CACHE_FILE: str = ''
+REBUILD_FROM_CACHE: bool = True
 BATCH_CACHE_DIR: str = f'/Users/dan/Dev/scu/InformationExtraction/cache/{
     MODEL_VERSION}/'
 EXTRACTIONS_CACHE_DIR: str = BATCH_CACHE_DIR + 'extractions/'
@@ -100,9 +105,12 @@ RAW_INPUT_TEXT_OUTPUT_DIR: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_d
 RAW_INPUT_TEXT_OUTPUT_FILE: str = 'summaries'
 RAW_INPUT_TEXT_OUTPUT_FORMAT: str = 'xlsx'
 OUTPUT_FORMAT: str = 'xlsx'
+EXPECTED_IDX_RANGE: tuple = (1, 17329)
 VALIDATE: bool = False
 PRINT_OUTPUT_OF_IDS: list[int] = []
-CUSTOM_SYMBOLIC: bool = True
+POST_PROCESS: bool = True
+LOG_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/tmp_data/log.txt'
+MISSING_IDS_FILE: str = '/Users/dan/Dev/scu/InformationExtraction/output/gpt/missing_ids.csv'
 
 
 class GPTDataProcessor:
@@ -137,7 +145,10 @@ class GPTDataProcessor:
                  rebuild_from_cache: bool = False,
                  batch_attempts: int = 5,
                  primary_data: str = '',
-                 custom_symbolic: bool = False,
+                 post_process: bool = False,
+                 log_file: str = './log.txt',
+                 expected_idx_range: tuple[int] = None,
+                 missing_ids_file: str = ''
                  ):
         self.model_version: str = model_version
         self.original_data_df: pd.DataFrame = None
@@ -175,7 +186,10 @@ class GPTDataProcessor:
         self.start_batch: int = start_batch if start_batch != 0 else 1
         self.rebuild_from_cache: bool = rebuild_from_cache
         self.batch_attempts: int = batch_attempts
-        self.custom_symbolic: bool = custom_symbolic
+        self.post_process: bool = post_process
+        self.log_file: str = log_file
+        self.expected_idx_range: tuple[int] = expected_idx_range
+        self.missing_ids_file: str = missing_ids_file
 
     def _get_api_key(self) -> None:
         with open('OPENAI_API_KEY.txt', 'r') as key:
@@ -256,9 +270,10 @@ class GPTDataProcessor:
                         results: list[tuple] = [
                             json.loads(r) for r in json_results]
                         for result_dict in results[0]['response']:
-                            extracted.append(result_dict)
+                            extracted.append(results[0]['response'])
                             batch_for_cache.append(result_dict)
                         if len(batch_for_cache) < len(batch):
+                            pp(f'Error in this result: {result_dict}')
                             raise Exception(f"""Error processing the batch: The batch size was {
                                             self.batch_size} but there were only {len(batch_for_cache)} records returned.""")
                         else:
@@ -310,13 +325,14 @@ class GPTDataProcessor:
                         results: list[dict] = self._rebuild_from_cache()
                     else:
                         results: list[dict] = self._execute_gpt()
+                    if self.post_process:
+                        results = PostProcess(input=results,
+                                              expected_range=self.expected_idx_range,
+                                              missing_ids_file=self.missing_ids_file).execute()
                     if len(results) != len(self.raw_input_text):
                         raise Exception(
-                            "Error extracting JSON data. Summary and response sizes do not match."
+                            "Warning: Summary and response sizes do not match."
                         )
-                    if self.custom_symbolic:
-                        results = CustomSymbolic.zero_no_ac_involved(
-                            input=results)
                     for summary in self.raw_input_text:
                         extractions['results'].append(
                             (summary, next((d for d in results if d.get("record_id") == summary[0]), None)))
@@ -441,6 +457,10 @@ class GPTDataProcessor:
             except KeyError:
                 pass
 
+    def _write_log(self, message: str = '') -> None:
+        with open(self.log_file, "a") as f:
+            f.write(message)
+
     def _write_output_file(self, mode: str = None, input_df: pd.DataFrame = None) -> None:
         if mode == 'validate' and not self.validated.empty:
             if self.output_format == 'xlsx':
@@ -525,7 +545,10 @@ def main() -> None:
                            rebuild_from_cache=REBUILD_FROM_CACHE,
                            batch_attempts=BATCH_ATTEMPTS,
                            primary_data=PRIMARY_DATA,
-                           custom_symbolic=CUSTOM_SYMBOLIC,
+                           post_process=POST_PROCESS,
+                           log_file=LOG_FILE,
+                           expected_idx_range=EXPECTED_IDX_RANGE,
+                           missing_ids_file=MISSING_IDS_FILE,
                            )
     gpt.execute()
 
